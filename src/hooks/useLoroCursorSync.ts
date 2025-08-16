@@ -29,7 +29,7 @@ function buildWsUrl(raw?: string, room?: string) {
     return u.toString();
   }
   const proto = typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss' : 'ws';
-  const host = typeof window !== 'undefined' ? window.location.host : 'localhost:3001';
+  const host = 'localhost:3001';
   const u = new URL(`${proto}://${host}`);
   if (!host.includes(':')) u.port = '3001';
   if (room) u.searchParams.set('room', room);
