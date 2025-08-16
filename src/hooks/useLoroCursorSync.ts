@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { LoroDoc, type Subscription } from 'loro-crdt';
+import { debounce } from 'lodash-es';
 
 export interface Cursor {
   id: string;
@@ -15,9 +16,10 @@ export interface Cursor {
 interface Options {
   wsUrl?: string;
   room?: string;
-  expireMs?: number;        // 多久无更新判定过期
-  cleanupEveryMs?: number;  // 清理扫描频率
-  keepAliveMs?: number;     // 心跳刷新频率（不动鼠标也续命）
+  expireMs?: number;        // 失活清理阈值
+  cleanupEveryMs?: number;  // 清理频率
+  keepAliveMs?: number;     // 心跳刷新
+  sendIntervalMs?: number;  // 本地→网络发送节流
 }
 
 function buildWsUrl(raw?: string, room?: string) {
@@ -38,42 +40,77 @@ export function useLoroCursorSync(options: Options = {}) {
   const {
     wsUrl,
     room,
-    expireMs = 30_000,      // 30秒过期
+    expireMs = 30_000,
     cleanupEveryMs = 5_000,
-    keepAliveMs = 10_000,   // 10秒心跳
+    keepAliveMs = 10_000,
+    sendIntervalMs = 70,    // **关键**：网络发送节流 ~14fps 就很顺了
   } = options;
 
+  // 身份
   const userId = useRef(`user-${Math.random().toString(36).slice(2, 9)}`).current;
   const userName = useRef(`用户${Math.floor(Math.random() * 1000)}`).current;
   const userColor = useRef(`hsl(${Math.random() * 360}, 70%, 60%)`).current;
 
+  // 连接 & 可见光标（不包含自己）
   const [isConnected, setIsConnected] = useState(false);
   const [cursors, setCursors] = useState<Map<string, Cursor>>(new Map());
 
+  // 本地“即时光标”（只用于 UI，不卡网络）
+  const [selfCursor, setSelfCursor] = useState<Cursor | null>(null);
+
+  // refs
   const wsRef = useRef<WebSocket | null>(null);
   const docRef = useRef<LoroDoc | null>(null);
   const unsubRef = useRef<Subscription | (() => void) | null>(null);
   const keepAliveTimerRef = useRef<NodeJS.Timeout | null>(null);
-  const backoffRef = useRef(1000); // 重连退避
-  const versionRef = useRef<Uint8Array | null>(null); // 记录版本，避免重复发送
+  const backoffRef = useRef(1000);
+  const lastSendAtRef = useRef(0);
+  const sendTimerRef = useRef<NodeJS.Timeout | null>(null);
 
-  console.log(`[INIT] userId=${userId}, userName=${userName}, userColor=${userColor}`);
+  // 合并导入（收到多条 snapshot，只导入最后一条）
+  const pendingSnapshotRef = useRef<Uint8Array | null>(null);
+  const importTimerRef = useRef<number | null>(null);
 
-  // 更新光标显示状态
-  const updateCursorsDisplay = useCallback(() => {
-    const doc = docRef.current;
-    if (!doc) return;
-    
-    try {
-      const map = doc.getMap('cursors');
-      const next = new Map<string, Cursor>();
-      const now = Date.now();
-      
-      for (const [key, value] of map.entries()) {
-        if (value && typeof value === 'object') {
-          const v: any = value;
-          if (typeof v.x === 'number' && typeof v.y === 'number' && typeof v.id === 'string') {
-            const cursor: Cursor = {
+  // == 工具 ==
+  const scheduleImport = useCallback(() => {
+    if (importTimerRef.current != null) return;
+    importTimerRef.current = window.setTimeout(() => {
+      importTimerRef.current = null;
+      const data = pendingSnapshotRef.current;
+      pendingSnapshotRef.current = null;
+      if (!data) return;
+      const doc = docRef.current;
+      if (!doc) return;
+      try {
+        doc.import(data);
+        // 导入后由订阅回调统一刷新 UI
+      } catch (e) {
+        console.error('[RECV] 导入失败:', e);
+      }
+    }, 16); // roughly 60fps
+  }, []);
+
+  // === Loro 文档 ===
+  useEffect(() => {
+    const doc = new LoroDoc();
+    docRef.current = doc;
+
+    const sub = doc.subscribe((event: any) => {
+      // 只把“别人”的光标投影到 UI；自己的即时光标走 selfCursor
+      try {
+        const map = doc.getMap('cursors');
+        const now = Date.now();
+        let changed = false;
+
+        setCursors(prev => {
+          const next = new Map<string, Cursor>();
+          for (const [key, value] of map.entries()) {
+            if (!value || typeof value !== 'object') continue;
+            const v: any = value;
+            if (v.id === userId) continue; // 自己的用 selfCursor 呈现
+            if (typeof v.x !== 'number' || typeof v.y !== 'number' || typeof v.id !== 'string') continue;
+
+            const cur: Cursor = {
               id: v.id,
               x: v.x,
               y: v.y,
@@ -81,268 +118,215 @@ export function useLoroCursorSync(options: Options = {}) {
               name: v.name || 'Unknown',
               lastUpdate: v.lastUpdate || now,
             };
-            
-            // 过滤过期光标
-            if (now - cursor.lastUpdate <= expireMs) {
-              next.set(key, cursor);
+
+            if (now - cur.lastUpdate <= expireMs) {
+              next.set(key, cur);
+              const prevCur = prev.get(key);
+              if (!prevCur || prevCur.x !== cur.x || prevCur.y !== cur.y || prevCur.lastUpdate !== cur.lastUpdate) {
+                changed = true;
+              }
             } else {
-              console.log(`[EXPIRE] 清理过期光标: ${cursor.name} (${cursor.id})`);
-              map.delete(key); // 从文档中删除过期光标
+              changed = true; // 过期从 UI 移除
             }
           }
-        }
+          if (prev.size !== next.size) changed = true;
+          return changed ? next : prev;
+        });
+      } catch (e) {
+        console.error('[DOC] 订阅处理失败:', e);
       }
-      
-      setCursors(next);
-      console.log(`[CURSORS] 更新显示: ${Array.from(next.keys()).join(', ')}`);
-    } catch (e) {
-      console.error('[CURSORS] 更新显示错误:', e);
-    }
-  }, [expireMs]);
 
-  // 发送文档更新
-  const sendDocumentUpdate = useCallback((reason: string) => {
-    const doc = docRef.current;
-    const ws = wsRef.current;
-    
-    if (!doc || !ws || ws.readyState !== WebSocket.OPEN) {
-      console.log(`[SEND SKIP] ${reason}, doc=${!!doc}, ws=${!!ws}, wsOpen=${!!ws && ws.readyState === WebSocket.OPEN}`);
-      return;
-    }
-
-    try {
-      // 获取完整的文档快照
-      const snapshot = doc.exportSnapshot();
-      
-      // 检查是否有变化（简单的字节对比）
-      if (versionRef.current && 
-          versionRef.current.length === snapshot.length &&
-          versionRef.current.every((val, i) => val === snapshot[i])) {
-        console.log(`[SEND SKIP] ${reason} - 无变化`);
-        return;
-      }
-      
-      versionRef.current = snapshot;
-      
-      const message = {
-        type: 'loro_snapshot',
-        data: Array.from(snapshot),
-        userId: userId,
-        room: room || 'default'
-      };
-      
-      ws.send(JSON.stringify(message));
-      console.log(`[SEND] ${reason}, snapshot bytes=${snapshot.length}`);
-    } catch (e) {
-      console.error('[SEND ERROR]', reason, e);
-    }
-  }, [userId, room]);
-
-  // 初始化 Loro 文档
-  useEffect(() => {
-    console.log('[DOC] 初始化 Loro 文档');
-    const doc = new LoroDoc();
-    docRef.current = doc;
-
-    // 订阅文档变化
-    const sub = doc.subscribe((event: any) => {
-      console.log('[DOC] 文档变化事件:', { local: event?.local, origin: event?.origin });
-      
-      // 更新光标显示
-      updateCursorsDisplay();
-      
-      // 如果是本地变化，发送到服务器
-      if (event?.local) {
-        // 延迟发送，避免频繁发送
-        setTimeout(() => sendDocumentUpdate('local change'), 50);
-      }
+      // 本地变更不再直接导出（避免每帧 CRDT 压力），交由“网络节流器”处理
     });
 
     unsubRef.current = sub;
 
     return () => {
-      console.log('[DOC] 清理 Loro 文档');
       const u = unsubRef.current;
       if (typeof u === 'function') u();
-      else if (u && 'unsubscribe' in u && typeof (u as any).unsubscribe === 'function') {
-        (u as any).unsubscribe();
-      }
+      else if (u && 'unsubscribe' in u && typeof (u as any).unsubscribe === 'function') (u as any).unsubscribe();
       unsubRef.current = null;
       docRef.current = null;
     };
-  }, [updateCursorsDisplay, sendDocumentUpdate]);
+  }, [expireMs, userId]);
 
-  // 心跳机制
+  // === 心跳：只刷新时间戳（低频，不触发重渲染） ===
   useEffect(() => {
     keepAliveTimerRef.current = setInterval(() => {
       const doc = docRef.current;
-      if (!doc || !isConnected) return;
-      
-      const map = doc.getMap('cursors');
-      const mine = map.get(userId) as any;
-      
+      const ws = wsRef.current;
+      if (!doc || !ws || ws.readyState !== WebSocket.OPEN) return;
+      const m = doc.getMap('cursors');
+      const mine = m.get(userId) as any;
       if (mine && typeof mine === 'object') {
-        // 更新心跳时间
-        const updated = { ...mine, lastUpdate: Date.now() };
-        map.set(userId, updated);
-        console.log(`[HEARTBEAT] 更新心跳: ${userName}`);
+        m.set(userId, { ...mine, lastUpdate: Date.now() });
+        // 让网络节流器稍后统一发送
+        scheduleSend('heartbeat');
       }
     }, keepAliveMs);
-
     return () => {
-      if (keepAliveTimerRef.current) {
-        clearInterval(keepAliveTimerRef.current);
-        keepAliveTimerRef.current = null;
-      }
+      if (keepAliveTimerRef.current) clearInterval(keepAliveTimerRef.current);
     };
-  }, [userId, userName, keepAliveMs, isConnected]);
+  }, [keepAliveMs, userId]);
 
-  // 定时清理过期光标
+  // === 过期清理（低频） ===
   useEffect(() => {
-    const timer = setInterval(() => {
-      updateCursorsDisplay();
+    const t = setInterval(() => {
+      setCursors(prev => {
+        const now = Date.now();
+        const next = new Map<string, Cursor>();
+        let changed = false;
+        for (const [k, c] of prev) {
+          if (now - c.lastUpdate <= expireMs) next.set(k, c);
+          else changed = true;
+        }
+        return changed ? next : prev;
+      });
     }, cleanupEveryMs);
-    
-    return () => clearInterval(timer);
-  }, [updateCursorsDisplay, cleanupEveryMs]);
+    return () => clearInterval(t);
+  }, [expireMs, cleanupEveryMs]);
 
-  // WebSocket 连接
+  // === WebSocket ===
   const connect = useCallback(() => {
     const urlToUse = buildWsUrl(wsUrl, room);
-    console.log(`[WS] 尝试连接: ${urlToUse}`);
-    
     try {
       const ws = new WebSocket(urlToUse);
       wsRef.current = ws;
 
       ws.onopen = () => {
-        console.log('[WS] 连接成功');
         setIsConnected(true);
-        backoffRef.current = 1000; // 重置退避时间
-        
-        // 连接成功后立即发送当前状态
-        setTimeout(() => {
-          sendDocumentUpdate('connection opened');
-        }, 100);
+        backoffRef.current = 1000;
+        // 请求全量
+        ws.send(JSON.stringify({ type: 'request_full_state', userId, room: room || 'default' }));
+        // 稍后把当前 Loro 状态（若有）发出去
+        setTimeout(() => scheduleSend('open sync'), 200);
       };
 
       ws.onclose = (ev) => {
-        console.warn(`[WS] 连接关闭: ${ev.code} ${ev.reason}`);
         setIsConnected(false);
-        
-        // 自动重连
         const delay = Math.min(backoffRef.current, 30_000);
-        console.log(`[WS] ${delay}ms 后重连`);
         setTimeout(connect, delay);
         backoffRef.current = Math.min(backoffRef.current * 2, 30_000);
       };
 
-      ws.onerror = (err) => {
-        console.error('[WS] 连接错误:', err);
+      ws.onerror = () => {
         setIsConnected(false);
       };
 
-      ws.onmessage = async (ev) => {
+      ws.onmessage = (ev) => {
         try {
           const msg = JSON.parse(ev.data);
-          console.log(`[RECV] 收到消息:`, { type: msg.type, userId: msg.userId, dataLength: msg.data?.length });
-          
           const doc = docRef.current;
           if (!doc) return;
 
-          if (msg.type === 'loro_snapshot' && Array.isArray(msg.data)) {
-            // 忽略自己发送的消息
-            if (msg.userId === userId) {
-              console.log('[RECV] 忽略自己的消息');
-              return;
-            }
-            
-            try {
-              const snapshot = new Uint8Array(msg.data);
-              
-              // 导入远程快照，这会触发文档更新事件
-              doc.import(snapshot);
-              console.log(`[RECV] 成功导入快照, bytes=${snapshot.length}`);
-              
-              // 强制更新显示
-              updateCursorsDisplay();
-            } catch (importError) {
-              console.error('[RECV] 导入快照失败:', importError);
-            }
+          if ((msg.type === 'loro_snapshot' || msg.type === 'full_state_response') && Array.isArray(msg.data)) {
+            // 合并导入：只保留最后一次
+            pendingSnapshotRef.current = new Uint8Array(msg.data);
+            scheduleImport();
           }
         } catch (e) {
-          console.error('[WS] 消息解析错误:', e);
+          console.error('[WS] 消息解析失败:', e);
         }
       };
-    } catch (e) {
-      console.error('[WS] 创建连接失败:', e);
+    } catch {
       setTimeout(connect, Math.min(backoffRef.current, 30_000));
       backoffRef.current = Math.min(backoffRef.current * 2, 30_000);
     }
-  }, [room, wsUrl, userId, sendDocumentUpdate, updateCursorsDisplay]);
+  }, [room, wsUrl, scheduleImport, userId]);
 
-  // 启动连接
   useEffect(() => {
     connect();
     return () => {
-      try { 
-        wsRef.current?.close(); 
-      } catch {}
+      try { wsRef.current?.close(); } catch {}
     };
   }, [connect]);
 
-  // 更新光标位置
-  const updateCursor = useCallback((x: number, y: number) => {
+  // === 网络发送：节流器 ===
+  const doSendNow = useCallback((why: string) => {
     const doc = docRef.current;
-    if (!doc) {
-      console.warn('[UPDATE] 文档未初始化');
+    const ws = wsRef.current;
+    if (!doc || !ws || ws.readyState !== WebSocket.OPEN) return;
+    try {
+      const snapshot = doc.exportSnapshot();
+      ws.send(JSON.stringify({
+        type: 'loro_snapshot',
+        data: Array.from(snapshot),
+        userId,
+        room: room || 'default',
+      }));
+      lastSendAtRef.current = Date.now();
+    } catch (e) {
+      console.error('[SEND] 失败:', e);
+    }
+  }, [room, userId]);
+
+  const scheduleSend = useCallback((why: string) => {
+    const now = Date.now();
+    const elapsed = now - lastSendAtRef.current;
+    if (elapsed >= sendIntervalMs) {
+      if (sendTimerRef.current) { clearTimeout(sendTimerRef.current); sendTimerRef.current = null; }
+      doSendNow(why);
       return;
     }
-    
-    try {
-      const map = doc.getMap('cursors');
-      const cursor = {
+    if (!sendTimerRef.current) {
+      sendTimerRef.current = setTimeout(() => {
+        sendTimerRef.current = null;
+        doSendNow(`${why} (throttled)`);
+      }, sendIntervalMs - elapsed);
+    }
+  }, [doSendNow, sendIntervalMs]);
+
+  // === 对外：本地光标更新（UI 即时 + 网络节流 + Loro 低频写入） ===
+  const updateCursor = useCallback((x: number, y: number) => {
+    // 1) UI 即时：不经 Loro，不卡顿
+    setSelfCursor(prev => {
+      const now = Date.now();
+      const base: Cursor = prev ?? {
+        id: userId, name: userName, color: userColor, x, y, lastUpdate: now,
+      };
+      return { ...base, x, y, lastUpdate: now };
+    });
+
+    // 2) Loro 低频写入（只有节流到点才写 doc & 触发发送）
+    const doc = docRef.current;
+    if (!doc) return;
+    const now = Date.now();
+    const elapsed = now - lastSendAtRef.current;
+
+    if (elapsed >= sendIntervalMs) {
+      const m = doc.getMap('cursors');
+      m.set(userId, {
         id: userId,
         x: Math.round(x),
         y: Math.round(y),
         color: userColor,
         name: userName,
-        lastUpdate: Date.now(),
-      };
-      
-      map.set(userId, cursor);
-      console.log(`[UPDATE] 更新光标位置: (${x}, ${y})`);
-    } catch (e) {
-      console.error('[UPDATE] 更新光标失败:', e);
+        lastUpdate: now,
+      });
+      scheduleSend('cursor move');
+    } else {
+      // 还没到节流时间：先不写 doc，等 scheduleSend 触发时再写
+      // （可选：如果你希望更精确，可在这里缓存坐标，到触发时再 m.set(…)，当前简单实现足够顺滑）
     }
-  }, [userColor, userName, userId]);
+  }, [userColor, userName, userId, scheduleSend, sendIntervalMs]);
 
-  // 移除光标
   const removeCursor = useCallback(() => {
+    setSelfCursor(null);
     const doc = docRef.current;
     if (!doc) return;
-    
-    try {
-      doc.getMap('cursors').delete(userId);
-      console.log(`[REMOVE] 移除光标: ${userId}`);
-    } catch (e) {
-      console.error('[REMOVE] 移除光标失败:', e);
-    }
-  }, [userId]);
+    doc.getMap('cursors').delete(userId);
+    scheduleSend('remove');
+  }, [scheduleSend, userId]);
 
-  // 强制重发
-  const forceResend = useCallback((reason = 'manual force resend') => {
-    // 清除版本记录，强制发送
-    versionRef.current = null;
-    sendDocumentUpdate(reason);
-  }, [sendDocumentUpdate]);
+  const forceResend = useCallback((reason = 'manual resend') => {
+    doSendNow(reason);
+  }, [doSendNow]);
 
   return {
-    userId, 
-    userName, 
-    userColor,
+    userId, userName, userColor,
     isConnected,
-    cursors,
+    cursors,          // 其他用户
+    selfCursor,       // 自己（即时渲染）
     updateCursor,
     removeCursor,
     forceResend,

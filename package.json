@@ -12,6 +12,9 @@
     "ws": "ts-node server/loro-ws-server.ts"
   },
   "dependencies": {
+    "@types/lodash-es": "^4.17.12",
+    "lodash": "^4.17.21",
+    "lodash-es": "^4.17.21",
     "loro-crdt": "^1.5.10",
     "next": "15.4.6",
     "react": "19.1.0",

@@ -1,6 +1,6 @@
 'use client';
 
-import { useRef, useCallback, useEffect } from 'react';
+import { useRef, useCallback, useEffect, useMemo } from 'react';
 import { useLoroCursorSync, type Cursor } from '@/hooks/useLoroCursorSync';
 
 const card: React.CSSProperties = {
@@ -11,13 +11,9 @@ const card: React.CSSProperties = {
   border: '1px solid #e5e7eb',
 };
 
-const badgeDot: React.CSSProperties = {
+const dot: React.CSSProperties = {
   display: 'inline-block',
-  width: 10,
-  height: 10,
-  borderRadius: 999,
-  marginRight: 8,
-  verticalAlign: 'middle',
+  width: 10, height: 10, borderRadius: 999, marginRight: 8, verticalAlign: 'middle',
 };
 
 const boardStyle: React.CSSProperties = {
@@ -35,330 +31,132 @@ const boardStyle: React.CSSProperties = {
 const gridBg: React.CSSProperties = {
   position: 'absolute',
   inset: 0 as any,
-  opacity: 0.1,
+  opacity: 0.08,
   backgroundImage: 'radial-gradient(circle, #000 1px, transparent 1px)',
   backgroundSize: '20px 20px',
 };
 
+function CursorView({ c }: { c: Cursor }) {
+  const style: React.CSSProperties = {
+    position: 'absolute',
+    pointerEvents: 'none',
+    willChange: 'transform',
+    transform: `translate3d(${c.x - 8}px, ${c.y - 8}px, 0)`,
+    transition: 'transform 80ms ease-out', // 小过渡，观感丝滑
+  };
+  return (
+    <div style={style}>
+      <svg width="16" height="16" viewBox="0 0 24 24" fill={c.color}>
+        <path d="M12 2L2 7L12 12L22 7L12 2Z" />
+        <path d="M12 12L2 17L12 22L22 17L12 12Z" opacity="0.6" />
+      </svg>
+      <div
+        style={{
+          position: 'absolute',
+          top: 18, left: 18,
+          padding: '2px 6px',
+          borderRadius: 6,
+          fontSize: 10, color: '#fff', fontWeight: 600,
+          background: c.color,
+          whiteSpace: 'nowrap',
+          boxShadow: `0 6px 14px ${c.color}33`,
+        }}
+      >
+        {c.name}
+      </div>
+    </div>
+  );
+}
+
 export default function CursorBoard() {
   const {
-    isConnected, 
+    isConnected,
     cursors,
-    userColor, 
-    userName,
-    userId,
-    updateCursor, 
-    removeCursor,
-    forceResend,
+    selfCursor,
+    userColor, userName,
+    updateCursor, removeCursor, forceResend,
   } = useLoroCursorSync({
     wsUrl: process.env.NEXT_PUBLIC_WS_URL,
-    room: 'demo-room', // 确保使用相同的房间
+    // room: 'demo',
+    sendIntervalMs: 70,       // 关键参数：网络节流
+    keepAliveMs: 8000,
   });
 
   const containerRef = useRef<HTMLDivElement>(null);
-  const lastUpdateRef = useRef<{ x: number; y: number; time: number } | null>(null);
-  const sentInitialRef = useRef(false);
 
-  // 节流的鼠标移动处理
+  // rAF 节流仅用于读取鼠标并更新“本地 UI”
   const rAFRef = useRef<number | null>(null);
-  const pendingRef = useRef<{ x: number; y: number } | null>(null);
+  const onMove = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+    if (!containerRef.current) return;
+    const rect = containerRef.current.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
 
-  const flushUpdate = useCallback(() => {
-    rAFRef.current = null;
-    if (!pendingRef.current) return;
-    
-    const { x, y } = pendingRef.current;
-    pendingRef.current = null;
-    
-    // 避免重复发送相同位置
-    const last = lastUpdateRef.current;
-    if (last && Math.abs(last.x - x) < 2 && Math.abs(last.y - y) < 2 && 
-        Date.now() - last.time < 100) {
-      return;
+    if (rAFRef.current == null) {
+      rAFRef.current = requestAnimationFrame(() => {
+        rAFRef.current = null;
+        updateCursor(x, y); // UI 即时 + 网络节流
+      });
     }
-    
-    lastUpdateRef.current = { x, y, time: Date.now() };
-    updateCursor(x, y);
   }, [updateCursor]);
 
-  const onMouseMove = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
-    if (!containerRef.current) return;
-    
-    const rect = containerRef.current.getBoundingClientRect();
-    const x = Math.max(0, Math.min(rect.width, e.clientX - rect.left));
-    const y = Math.max(0, Math.min(rect.height, e.clientY - rect.top));
-    
-    pendingRef.current = { x, y };
-    
-    if (rAFRef.current === null) {
-      rAFRef.current = requestAnimationFrame(flushUpdate);
-    }
-  }, [flushUpdate]);
-
-  const onMouseLeave = useCallback(() => {
-    // 取消待处理的更新
-    if (rAFRef.current !== null) {
-      cancelAnimationFrame(rAFRef.current);
-      rAFRef.current = null;
-      pendingRef.current = null;
-    }
-    
+  const onLeave = useCallback(() => {
     removeCursor();
-    lastUpdateRef.current = null;
-    console.log('[UI] 鼠标离开，移除光标');
   }, [removeCursor]);
 
-  const onMouseEnter = useCallback(() => {
-    if (!containerRef.current || !isConnected) return;
-    
-    // 鼠标进入时设置一个初始位置
-    const rect = containerRef.current.getBoundingClientRect();
-    const centerX = rect.width / 2;
-    const centerY = rect.height / 2;
-    
-    updateCursor(centerX, centerY);
-    console.log('[UI] 鼠标进入，设置初始位置');
-  }, [isConnected, updateCursor]);
-
-  // 连接成功后的初始化
+  // 首次进入：把光标放在中心并强制发一次（确保对端能立刻看到）
   useEffect(() => {
-    if (!isConnected || sentInitialRef.current) return;
-    
-    const timer = setTimeout(() => {
-      const el = containerRef.current;
-      if (!el) return;
-      
-      const rect = el.getBoundingClientRect();
-      const centerX = rect.width / 2;
-      const centerY = rect.height / 2;
-      
-      console.log('[UI] 连接成功，设置中心位置:', { centerX, centerY });
-      updateCursor(centerX, centerY);
-      
-      // 强制重发确保对方收到
-      setTimeout(() => {
-        forceResend('initial center after connection');
-      }, 200);
-      
-      sentInitialRef.current = true;
-    }, 100);
+    const el = containerRef.current;
+    if (!el || !isConnected) return;
+    const rect = el.getBoundingClientRect();
+    const cx = Math.max(8, rect.width / 2);
+    const cy = Math.max(8, rect.height / 2);
+    updateCursor(cx, cy);
+    forceResend('initial center');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isConnected]);
 
-    return () => clearTimeout(timer);
-  }, [isConnected, updateCursor, forceResend]);
-
-  // 调试：监听光标变化
-  useEffect(() => {
-    const cursorList = Array.from(cursors.values()).map(c => `${c.name}(${c.x},${c.y})`);
-    console.log(`[UI] 光标状态更新: connected=${isConnected}, cursors=[${cursorList.join(', ')}]`);
-  }, [isConnected, cursors]);
-
-  // 清理 RAF
-  useEffect(() => {
-    return () => {
-      if (rAFRef.current !== null) {
-        cancelAnimationFrame(rAFRef.current);
-      }
-    };
-  }, []);
+  // 其他用户（Map→Array）
+  const others = useMemo(() => Array.from<Cursor>(cursors.values()), [cursors]);
 
   return (
     <div style={{ minHeight: '100vh', background: '#f8fafc', padding: 24 }}>
-      {/* 状态卡片 */}
       <div style={{ ...card, marginBottom: 16 }}>
-        <h1 style={{ margin: 0, fontSize: 22, fontWeight: 700, color: '#111827' }}>
-          🖱️ Loro + Next.js 光标同步演示
-        </h1>
-        <div style={{ marginTop: 12, fontSize: 14, color: '#374151' }}>
-          <div style={{ marginBottom: 8 }}>
-            <span style={{ ...badgeDot, background: userColor }} />
-            当前用户：<strong>{userName}</strong> <code>({userId})</code>
-            <span style={{ marginLeft: 16 }}>
-              <span
-                style={{
-                  ...badgeDot,
-                  background: isConnected ? '#22c55e' : '#ef4444',
-                  marginRight: 6,
-                }}
-              />
-              {isConnected ? '✅ 已连接 WebSocket' : '❌ 未连接 WebSocket'}
-            </span>
-          </div>
-          <div>
-            <span style={{ marginRight: 16 }}>
-              在线光标数量：<strong>{cursors.size}</strong>
-            </span>
-            <span>
-              房间：<code>demo-room</code>
-            </span>
-          </div>
+        <h1 style={{ margin: 0, fontSize: 22, fontWeight: 700, color: '#111827' }}>🖱️ Loro + WS 光标同步（丝滑版）</h1>
+        <div style={{ marginTop: 10, fontSize: 14, color: '#374151' }}>
+          <span style={{ ...dot, background: userColor }} />
+          当前用户：<b>{userName}</b>
+          <span style={{ marginLeft: 16 }}>
+            <span style={{ ...dot, background: isConnected ? '#22c55e' : '#ef4444' }} />
+            {isConnected ? '已连接' : '未连接'}
+          </span>
+          <span style={{ marginLeft: 16 }}>在线光标（含自己）：{others.length + (selfCursor ? 1 : 0)}</span>
         </div>
-        
-        <div style={{ marginTop: 12, fontSize: 12, color: '#6b7280', lineHeight: 1.5 }}>
-          <div>💡 <strong>测试方法：</strong>在新标签页中打开相同页面，移动鼠标查看实时同步效果</div>
-          <div>🔧 <strong>调试信息：</strong>打开浏览器控制台查看详细日志</div>
-          <div>🌐 <strong>WebSocket地址：</strong> <code>{process.env.NEXT_PUBLIC_WS_URL || 'ws://localhost:3001'}</code></div>
+        <div style={{ marginTop: 8, fontSize: 12, color: '#6b7280' }}>
+          说明：本地光标动画不经 CRDT，网络每 ~70ms 发送一次；收到多条更新只导入一次，不卡顿。
         </div>
       </div>
 
-      {/* 光标同步面板 */}
       <div style={{ ...card }}>
         <div
           ref={containerRef}
           style={boardStyle}
-          onMouseMove={onMouseMove}
-          onMouseEnter={onMouseEnter}
-          onMouseLeave={onMouseLeave}
+          onMouseMove={onMove}
+          onMouseLeave={onLeave}
         >
-          {/* 背景网格 */}
           <div style={gridBg} />
 
-          {/* 说明文字 */}
-          <div style={{ 
-            position: 'absolute', 
-            top: 16, 
-            left: 16, 
-            color: '#6b7280', 
-            fontSize: 13,
-            background: 'rgba(255,255,255,0.8)',
-            padding: '6px 10px',
-            borderRadius: 6,
-            backdropFilter: 'blur(4px)'
-          }}>
-            在此区域移动鼠标，查看跨标签页的实时光标同步
+          <div style={{ position: 'absolute', top: 12, left: 12, color: '#6b7280', fontSize: 12 }}>
+            在白色面板内移动鼠标，应该是丝滑的 ✨
           </div>
 
-          {/* 连接状态指示器 */}
-          {!isConnected && (
-            <div style={{
-              position: 'absolute',
-              top: '50%',
-              left: '50%',
-              transform: 'translate(-50%, -50%)',
-              background: 'rgba(239, 68, 68, 0.1)',
-              border: '2px dashed #ef4444',
-              borderRadius: 8,
-              padding: '20px 24px',
-              color: '#dc2626',
-              fontSize: 14,
-              fontWeight: 600,
-              textAlign: 'center'
-            }}>
-              ⚠️ WebSocket 未连接<br/>
-              <span style={{ fontSize: 12, fontWeight: 400 }}>
-                请检查服务器是否运行
-              </span>
-            </div>
-          )}
+          {/* 别人的光标 */}
+          {others.map((c) => <CursorView key={c.id} c={c} />)}
 
-          {/* 渲染所有光标 */}
-          {Array.from(cursors.values()).map((cursor) => (
-            <div
-              key={cursor.id}
-              style={{
-                position: 'absolute',
-                left: cursor.x - 8,
-                top: cursor.y - 8,
-                pointerEvents: 'none',
-                transform: 'translate(0, 0)',
-                transition: cursor.id === userId ? 'none' : 'all 0.1s ease-out', // 自己的光标不用过渡
-                zIndex: cursor.id === userId ? 20 : 10, // 自己的光标在最上层
-              }}
-            >
-              {/* 光标图标 */}
-              <svg 
-                width="16" 
-                height="16" 
-                viewBox="0 0 24 24" 
-                fill={cursor.color}
-                style={{
-                  filter: 'drop-shadow(0 2px 4px rgba(0,0,0,0.2))',
-                }}
-              >
-                <path d="M12 2L2 7L12 12L22 7L12 2Z" />
-                <path d="M12 12L2 17L12 22L22 17L12 12Z" opacity="0.6" />
-              </svg>
-
-              {/* 用户名标签 */}
-              <div
-                style={{
-                  position: 'absolute',
-                  top: 20,
-                  left: 20,
-                  padding: '4px 8px',
-                  borderRadius: 6,
-                  fontSize: 11,
-                  color: '#fff',
-                  background: cursor.color,
-                  whiteSpace: 'nowrap',
-                  boxShadow: `0 4px 12px ${cursor.color}40`,
-                  fontWeight: 600,
-                  lineHeight: 1,
-                  border: cursor.id === userId ? '2px solid #fff' : 'none', // 高亮自己
-                }}
-              >
-                {cursor.name}
-                {cursor.id === userId && ' (你)'}
-              </div>
-
-              {/* 光标脉冲效果 */}
-              <div
-                style={{
-                  position: 'absolute',
-                  top: -4,
-                  left: -4,
-                  width: 24,
-                  height: 24,
-                  borderRadius: '50%',
-                  background: cursor.color,
-                  opacity: 0.2,
-                  animation: 'pulse 2s infinite',
-                }}
-              />
-            </div>
-          ))}
-
-          {/* 光标计数 */}
-          {cursors.size > 0 && (
-            <div style={{
-              position: 'absolute',
-              bottom: 16,
-              right: 16,
-              background: 'rgba(0,0,0,0.7)',
-              color: '#fff',
-              padding: '6px 12px',
-              borderRadius: 20,
-              fontSize: 12,
-              fontWeight: 600,
-              backdropFilter: 'blur(4px)'
-            }}>
-              {cursors.size} 个活跃光标
-            </div>
-          )}
-        </div>
-
-        {/* 底部说明 */}
-        <div style={{ marginTop: 12, fontSize: 12, color: '#6b7280', lineHeight: 1.4 }}>
-          <div><strong>🔍 故障排查：</strong></div>
-          <div>• 确保 WebSocket 服务器在 <code>localhost:3001</code> 运行</div>
-          <div>• 检查浏览器控制台是否有 [SEND]/[RECV] 日志输出</div>
-          <div>• 确认多个标签页连接到相同的房间 (<code>demo-room</code>)</div>
-          <div>• 如果仍有问题，尝试刷新页面重新连接</div>
+          {/* 自己的光标（即时） */}
+          {selfCursor && <CursorView c={selfCursor} />}
         </div>
       </div>
-
-      {/* CSS 动画 */}
-      <style jsx>{`
-        @keyframes pulse {
-          0%, 100% {
-            opacity: 0.2;
-            transform: scale(1);
-          }
-          50% {
-            opacity: 0.1;
-            transform: scale(1.2);
-          }
-        }
-      `}</style>
     </div>
   );
 }

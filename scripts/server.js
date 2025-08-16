@@ -8,6 +8,7 @@ class CursorSyncServer {
   constructor() {
     this.rooms = new Map(); // 房间 -> Set<WebSocket>
     this.clientRooms = new Map(); // WebSocket -> 房间名
+    this.roomStates = new Map(); // 房间 -> 最新的完整状态快照
     this.setupServer();
   }
 
@@ -101,7 +102,14 @@ class CursorSyncServer {
     
     switch (type) {
       case 'loro_snapshot':
+        // 保存房间状态
+        this.updateRoomState(room || this.clientRooms.get(ws), message.data);
         this.broadcastToRoom(ws, message);
+        break;
+        
+      case 'request_full_state':
+        // 发送完整房间状态
+        this.sendFullState(ws, room || this.clientRooms.get(ws));
         break;
         
       case 'ping':
@@ -141,6 +149,53 @@ class CursorSyncServer {
     });
 
     console.log(`[SERVER] 广播到房间 ${room}: 发送给 ${sentCount} 个客户端`);
+  }
+
+  // 更新房间状态
+  updateRoomState(room, data) {
+    if (!room || !data) return;
+    
+    this.roomStates.set(room, {
+      data: data,
+      timestamp: Date.now()
+    });
+    
+    console.log(`[SERVER] 更新房间 ${room} 状态, 数据大小: ${data.length}`);
+  }
+
+  // 发送完整房间状态
+  sendFullState(ws, room) {
+    if (!room) {
+      console.warn('[SERVER] 无法发送完整状态，房间名为空');
+      return;
+    }
+
+    const roomState = this.roomStates.get(room);
+    
+    if (!roomState) {
+      console.log(`[SERVER] 房间 ${room} 暂无状态，发送空状态`);
+      // 发送空状态响应
+      ws.send(JSON.stringify({
+        type: 'full_state_response',
+        room: room,
+        data: [],
+        isEmpty: true
+      }));
+      return;
+    }
+
+    console.log(`[SERVER] 发送房间 ${room} 完整状态给客户端，数据大小: ${roomState.data.length}`);
+    
+    try {
+      ws.send(JSON.stringify({
+        type: 'full_state_response',
+        room: room,
+        data: roomState.data,
+        timestamp: roomState.timestamp
+      }));
+    } catch (error) {
+      console.error('[SERVER] 发送完整状态失败:', error);
+    }
   }
 
   // 获取服务器状态
